@@ -9,6 +9,9 @@ import os
 import traceback
 import configparser
 import logging
+import argparse
+import sqlite3
+from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
@@ -30,15 +33,183 @@ logger = logging.getLogger(__name__)
 
 def get_config_files() -> list:
     """Получает список конфигурационных файлов."""
-    config_files = ["featureserver.cfg", "config.ini"]
-    
-    missing_files = [file_name for file_name in config_files if not os.path.exists(file_name)]
-    if missing_files:
-        for file_name in missing_files:
-            logger.error(f"Отсутствует обязательный конфигурационный файл {file_name}")
-        sys.exit(1)
+    optional = ["featureserver.cfg", "config.ini"]
+    return [file_name for file_name in optional if os.path.exists(file_name)]
 
-    return config_files
+
+def parse_bool(value: Optional[str], default: bool = False) -> bool:
+    """Преобразует строковое значение в bool."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Неверное булево значение: {value}")
+
+
+def parse_cli_args() -> argparse.Namespace:
+    """Парсинг аргументов командной строки."""
+    parser = argparse.ArgumentParser(
+        description="ArcGIS SOAP/REST Server",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Явный алиас, как просили: -help
+    parser.add_argument("-help", action="help", help="Показать это сообщение и выйти")
+
+    parser.add_argument("--port", type=int, default=None, help="Порт HTTP сервера")
+    parser.add_argument("--pool-monitor-interval", type=int, default=None, help="Интервал мониторинга пулов (сек)")
+
+    parser.add_argument("--auth-enabled", default=None, help="Включить аутентификацию (true/false)")
+    parser.add_argument("--auth-type", default=None, help="Тип аутентификации (basic/token/ldap)")
+    parser.add_argument("--auth-username", default=None, help="Логин для Basic auth")
+    parser.add_argument("--auth-password", default=None, help="Пароль для Basic auth")
+    parser.add_argument("--auth-token-secret", default=None, help="Секрет для токенов")
+    parser.add_argument("--auth-token-expiry", type=int, default=None, help="Время жизни токена, сек")
+    parser.add_argument("--auth-ldap-server", default=None, help="LDAP сервер")
+    parser.add_argument("--auth-ldap-base-dn", default=None, help="LDAP base DN")
+    parser.add_argument("--auth-ldap-bind-dn", default=None, help="LDAP bind DN")
+    parser.add_argument("--auth-ldap-bind-password", default=None, help="LDAP bind пароль")
+
+    return parser.parse_args()
+
+
+def merge_cli_overrides(server: 'Server', args: argparse.Namespace) -> None:
+    """Применяет переопределения из CLI поверх загруженной конфигурации."""
+    if args.port is not None:
+        server.metadata["port"] = str(args.port)
+    elif "port" not in server.metadata:
+        server.metadata["port"] = "8888"
+
+    if args.pool_monitor_interval is not None:
+        server.metadata["pool_monitor_interval"] = str(args.pool_monitor_interval)
+
+    cli_auth = {
+        "enabled": args.auth_enabled,
+        "type": args.auth_type,
+        "username": args.auth_username,
+        "password": args.auth_password,
+        "token_secret": args.auth_token_secret,
+        "token_expiry": args.auth_token_expiry,
+        "ldap_server": args.auth_ldap_server,
+        "ldap_base_dn": args.auth_ldap_base_dn,
+        "ldap_bind_dn": args.auth_ldap_bind_dn,
+        "ldap_bind_password": args.auth_ldap_bind_password,
+    }
+    for key, value in cli_auth.items():
+        if value is not None:
+            server.auth_config[key] = value
+
+    if "enabled" not in server.auth_config:
+        server.auth_config["enabled"] = False
+    else:
+        server.auth_config["enabled"] = parse_bool(server.auth_config["enabled"], default=False)
+
+    if "token_expiry" in server.auth_config:
+        server.auth_config["token_expiry"] = int(server.auth_config["token_expiry"])
+    else:
+        server.auth_config["token_expiry"] = 3600
+
+    from Auth import AuthenticationManager
+    if server.auth_config.get("enabled", False):
+        server.auth_manager = AuthenticationManager(server.auth_config)
+    else:
+        server.auth_manager = None
+
+
+def _choose_sqlite_file_interactive() -> Path:
+    """Находит SQLite файлы рядом с Server.py и предлагает выбрать при множественных вариантах."""
+    repo_dir = Path(__file__).resolve().parent
+    sqlite_files = sorted(repo_dir.glob("*.sqlite")) + sorted(repo_dir.glob("*.sqlite3")) + sorted(repo_dir.glob("*.db"))
+    sqlite_files = list(dict.fromkeys(sqlite_files))
+
+    if not sqlite_files:
+        raise FileNotFoundError("Не найдено ни одного SQLite файла рядом с Server.py")
+
+    if len(sqlite_files) == 1:
+        logger.info("Найдена база SQLite: %s", sqlite_files[0])
+        return sqlite_files[0]
+
+    print("\nНайдено несколько SQLite баз. Выберите номер:")
+    for idx, db_file in enumerate(sqlite_files, start=1):
+        print(f"  {idx}. {db_file.name}")
+
+    while True:
+        selected = input("Введите номер базы: ").strip()
+        if selected.isdigit():
+            pos = int(selected)
+            if 1 <= pos <= len(sqlite_files):
+                chosen = sqlite_files[pos - 1]
+                logger.info("Выбрана база SQLite: %s", chosen)
+                return chosen
+        print("Некорректный выбор. Повторите ввод.")
+
+
+def _detect_spatial_layers(dsn: Path) -> list:
+    """Читает spatial metadata и возвращает список слоев и геополя."""
+    layers = []
+    conn = sqlite3.connect(str(dsn))
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='geometry_columns'")
+        has_geometry_columns = cur.fetchone() is not None
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gpkg_geometry_columns'")
+        has_gpkg_geometry_columns = cur.fetchone() is not None
+
+        if has_geometry_columns:
+            cur.execute("SELECT f_table_name, f_geometry_column FROM geometry_columns ORDER BY f_table_name")
+            layers = [{"layer": row[0], "geom_col": row[1]} for row in cur.fetchall()]
+        elif has_gpkg_geometry_columns:
+            cur.execute("SELECT table_name, column_name FROM gpkg_geometry_columns ORDER BY table_name")
+            layers = [{"layer": row[0], "geom_col": row[1]} for row in cur.fetchall()]
+    finally:
+        conn.close()
+    return layers
+
+
+def _build_sqlite_runtime_config() -> configparser.ConfigParser:
+    """Создаёт runtime-конфиг из SQLite метаданных, если cfg-файлы отсутствуют."""
+    dsn_path = _choose_sqlite_file_interactive()
+    layers = _detect_spatial_layers(dsn_path)
+    if not layers:
+        raise RuntimeError(
+            "В выбранной SQLite базе не найдены пространственные слои (geometry_columns/gpkg_geometry_columns)."
+        )
+
+    print("\nДоступные пространственные слои:")
+    for idx, layer_info in enumerate(layers, start=1):
+        print(f"  {idx}. layer={layer_info['layer']} geom_col={layer_info['geom_col']}")
+
+    chosen_layer = layers[0]
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "sqlite": {
+            "type": "SQLite",
+            "dsn": f"./{dsn_path.name}",
+            "layer": chosen_layer["layer"],
+            "fid_col": "OBJECTID",
+            "geom_col": chosen_layer["geom_col"],
+            "max_connections": "10",
+            "timeout": "30",
+            "check_interval": "300",
+            "max_lifetime": "3600"
+        },
+        "server": {
+            "port": "8888"
+        },
+        "auth": {
+            "enabled": "false"
+        }
+    })
+
+    print("\nСформированные ключи runtime-конфигурации:")
+    for key, value in cfg.items("sqlite"):
+        print(f"  {key} = {value}")
+    return cfg
 
 class Server:
     """Сервер управляет конфигурацией и источниками данных."""
@@ -80,7 +251,10 @@ class Server:
     def load(cls, *files: str) -> 'Server':
         """Загружает конфигурацию сервера и источники данных."""
         config = configparser.ConfigParser()
-        config.read(files)
+        if files:
+            config.read(files)
+        else:
+            config = _build_sqlite_runtime_config()
         
         metadata = {}
         datasources = {}
@@ -216,10 +390,16 @@ def cleanup_on_exit():
 # Запуск сервера
 if __name__ == '__main__':
     try:
+        args = parse_cli_args()
         server = create_app()
+        merge_cli_overrides(server, args)
         port = int(server.metadata.get('port', 8888))
+        host = server.metadata.get('host', 'localhost')
+        base_url = server.metadata.get('url', f'http://{host}:{port}')
         logger.info(f"Starting server on port {port}...")
         logger.info(f"Authentication enabled: {server.auth_manager is not None}")
+        logger.info(f"ArcMap REST endpoint: {base_url}/aodk/rest")
+        logger.info(f"ArcMap SOAP WSDL: {base_url}/aodk/soap?wsdl")
         
         httpd = make_server('', port, wsgiApp)
         logger.info(f"Server started successfully on port {port}")
