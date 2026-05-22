@@ -10,8 +10,6 @@ import traceback
 import configparser
 import logging
 import argparse
-import sqlite3
-from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
@@ -33,8 +31,16 @@ logger = logging.getLogger(__name__)
 
 def get_config_files() -> list:
     """Получает список конфигурационных файлов."""
-    optional = ["featureserver.cfg", "config.ini"]
-    return [file_name for file_name in optional if os.path.exists(file_name)]
+    required = ["featureserver.cfg"]
+    optional = ["config.ini"]
+
+    missing_required = [file_name for file_name in required if not os.path.exists(file_name)]
+    if missing_required:
+        for file_name in missing_required:
+            logger.error(f"Отсутствует обязательный конфигурационный файл {file_name}")
+        sys.exit(1)
+
+    return required + [file_name for file_name in optional if os.path.exists(file_name)]
 
 
 def parse_bool(value: Optional[str], default: bool = False) -> bool:
@@ -119,97 +125,6 @@ def merge_cli_overrides(server: 'Server', args: argparse.Namespace) -> None:
         server.auth_manager = AuthenticationManager(server.auth_config)
     else:
         server.auth_manager = None
-
-
-def _choose_sqlite_file_interactive() -> Path:
-    """Находит SQLite файлы рядом с Server.py и предлагает выбрать при множественных вариантах."""
-    repo_dir = Path(__file__).resolve().parent
-    sqlite_files = sorted(repo_dir.glob("*.sqlite")) + sorted(repo_dir.glob("*.sqlite3")) + sorted(repo_dir.glob("*.db"))
-    sqlite_files = list(dict.fromkeys(sqlite_files))
-
-    if not sqlite_files:
-        raise FileNotFoundError("Не найдено ни одного SQLite файла рядом с Server.py")
-
-    if len(sqlite_files) == 1:
-        logger.info("Найдена база SQLite: %s", sqlite_files[0])
-        return sqlite_files[0]
-
-    print("\nНайдено несколько SQLite баз. Выберите номер:")
-    for idx, db_file in enumerate(sqlite_files, start=1):
-        print(f"  {idx}. {db_file.name}")
-
-    while True:
-        selected = input("Введите номер базы: ").strip()
-        if selected.isdigit():
-            pos = int(selected)
-            if 1 <= pos <= len(sqlite_files):
-                chosen = sqlite_files[pos - 1]
-                logger.info("Выбрана база SQLite: %s", chosen)
-                return chosen
-        print("Некорректный выбор. Повторите ввод.")
-
-
-def _detect_spatial_layers(dsn: Path) -> list:
-    """Читает spatial metadata и возвращает список слоев и геополя."""
-    layers = []
-    conn = sqlite3.connect(str(dsn))
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='geometry_columns'")
-        has_geometry_columns = cur.fetchone() is not None
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='gpkg_geometry_columns'")
-        has_gpkg_geometry_columns = cur.fetchone() is not None
-
-        if has_geometry_columns:
-            cur.execute("SELECT f_table_name, f_geometry_column FROM geometry_columns ORDER BY f_table_name")
-            layers = [{"layer": row[0], "geom_col": row[1]} for row in cur.fetchall()]
-        elif has_gpkg_geometry_columns:
-            cur.execute("SELECT table_name, column_name FROM gpkg_geometry_columns ORDER BY table_name")
-            layers = [{"layer": row[0], "geom_col": row[1]} for row in cur.fetchall()]
-    finally:
-        conn.close()
-    return layers
-
-
-def _build_sqlite_runtime_config() -> configparser.ConfigParser:
-    """Создаёт runtime-конфиг из SQLite метаданных, если cfg-файлы отсутствуют."""
-    dsn_path = _choose_sqlite_file_interactive()
-    layers = _detect_spatial_layers(dsn_path)
-    if not layers:
-        raise RuntimeError(
-            "В выбранной SQLite базе не найдены пространственные слои (geometry_columns/gpkg_geometry_columns)."
-        )
-
-    print("\nДоступные пространственные слои:")
-    for idx, layer_info in enumerate(layers, start=1):
-        print(f"  {idx}. layer={layer_info['layer']} geom_col={layer_info['geom_col']}")
-
-    chosen_layer = layers[0]
-    cfg = configparser.ConfigParser()
-    cfg.read_dict({
-        "sqlite": {
-            "type": "SQLite",
-            "dsn": f"./{dsn_path.name}",
-            "layer": chosen_layer["layer"],
-            "fid_col": "OBJECTID",
-            "geom_col": chosen_layer["geom_col"],
-            "max_connections": "10",
-            "timeout": "30",
-            "check_interval": "300",
-            "max_lifetime": "3600"
-        },
-        "server": {
-            "port": "8888"
-        },
-        "auth": {
-            "enabled": "false"
-        }
-    })
-
-    print("\nСформированные ключи runtime-конфигурации:")
-    for key, value in cfg.items("sqlite"):
-        print(f"  {key} = {value}")
-    return cfg
 
 class Server:
     """Сервер управляет конфигурацией и источниками данных."""
