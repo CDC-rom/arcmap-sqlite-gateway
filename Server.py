@@ -9,6 +9,7 @@ import os
 import traceback
 import configparser
 import logging
+import argparse
 from typing import Optional, Dict, Any
 from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
@@ -30,15 +31,100 @@ logger = logging.getLogger(__name__)
 
 def get_config_files() -> list:
     """Получает список конфигурационных файлов."""
-    config_files = ["featureserver.cfg", "config.ini"]
-    
-    missing_files = [file_name for file_name in config_files if not os.path.exists(file_name)]
-    if missing_files:
-        for file_name in missing_files:
+    required = ["featureserver.cfg"]
+    optional = ["config.ini"]
+
+    missing_required = [file_name for file_name in required if not os.path.exists(file_name)]
+    if missing_required:
+        for file_name in missing_required:
             logger.error(f"Отсутствует обязательный конфигурационный файл {file_name}")
         sys.exit(1)
 
-    return config_files
+    return required + [file_name for file_name in optional if os.path.exists(file_name)]
+
+
+def parse_bool(value: Optional[str], default: bool = False) -> bool:
+    """Преобразует строковое значение в bool."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Неверное булево значение: {value}")
+
+
+def parse_cli_args() -> argparse.Namespace:
+    """Парсинг аргументов командной строки."""
+    parser = argparse.ArgumentParser(
+        description="ArcGIS SOAP/REST Server",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # Явный алиас, как просили: -help
+    parser.add_argument("-help", action="help", help="Показать это сообщение и выйти")
+
+    parser.add_argument("--port", type=int, default=None, help="Порт HTTP сервера")
+    parser.add_argument("--pool-monitor-interval", type=int, default=None, help="Интервал мониторинга пулов (сек)")
+
+    parser.add_argument("--auth-enabled", default=None, help="Включить аутентификацию (true/false)")
+    parser.add_argument("--auth-type", default=None, help="Тип аутентификации (basic/token/ldap)")
+    parser.add_argument("--auth-username", default=None, help="Логин для Basic auth")
+    parser.add_argument("--auth-password", default=None, help="Пароль для Basic auth")
+    parser.add_argument("--auth-token-secret", default=None, help="Секрет для токенов")
+    parser.add_argument("--auth-token-expiry", type=int, default=None, help="Время жизни токена, сек")
+    parser.add_argument("--auth-ldap-server", default=None, help="LDAP сервер")
+    parser.add_argument("--auth-ldap-base-dn", default=None, help="LDAP base DN")
+    parser.add_argument("--auth-ldap-bind-dn", default=None, help="LDAP bind DN")
+    parser.add_argument("--auth-ldap-bind-password", default=None, help="LDAP bind пароль")
+
+    return parser.parse_args()
+
+
+def merge_cli_overrides(server: 'Server', args: argparse.Namespace) -> None:
+    """Применяет переопределения из CLI поверх загруженной конфигурации."""
+    if args.port is not None:
+        server.metadata["port"] = str(args.port)
+    elif "port" not in server.metadata:
+        server.metadata["port"] = "8888"
+
+    if args.pool_monitor_interval is not None:
+        server.metadata["pool_monitor_interval"] = str(args.pool_monitor_interval)
+
+    cli_auth = {
+        "enabled": args.auth_enabled,
+        "type": args.auth_type,
+        "username": args.auth_username,
+        "password": args.auth_password,
+        "token_secret": args.auth_token_secret,
+        "token_expiry": args.auth_token_expiry,
+        "ldap_server": args.auth_ldap_server,
+        "ldap_base_dn": args.auth_ldap_base_dn,
+        "ldap_bind_dn": args.auth_ldap_bind_dn,
+        "ldap_bind_password": args.auth_ldap_bind_password,
+    }
+    for key, value in cli_auth.items():
+        if value is not None:
+            server.auth_config[key] = value
+
+    if "enabled" not in server.auth_config:
+        server.auth_config["enabled"] = False
+    else:
+        server.auth_config["enabled"] = parse_bool(server.auth_config["enabled"], default=False)
+
+    if "token_expiry" in server.auth_config:
+        server.auth_config["token_expiry"] = int(server.auth_config["token_expiry"])
+    else:
+        server.auth_config["token_expiry"] = 3600
+
+    from Auth import AuthenticationManager
+    if server.auth_config.get("enabled", False):
+        server.auth_manager = AuthenticationManager(server.auth_config)
+    else:
+        server.auth_manager = None
 
 class Server:
     """Сервер управляет конфигурацией и источниками данных."""
@@ -216,10 +302,16 @@ def cleanup_on_exit():
 # Запуск сервера
 if __name__ == '__main__':
     try:
+        args = parse_cli_args()
         server = create_app()
+        merge_cli_overrides(server, args)
         port = int(server.metadata.get('port', 8888))
+        host = server.metadata.get('host', 'localhost')
+        base_url = server.metadata.get('url', f'http://{host}:{port}')
         logger.info(f"Starting server on port {port}...")
         logger.info(f"Authentication enabled: {server.auth_manager is not None}")
+        logger.info(f"ArcMap REST endpoint: {base_url}/aodk/rest")
+        logger.info(f"ArcMap SOAP WSDL: {base_url}/aodk/soap?wsdl")
         
         httpd = make_server('', port, wsgiApp)
         logger.info(f"Server started successfully on port {port}")
