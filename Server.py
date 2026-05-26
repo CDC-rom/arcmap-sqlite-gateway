@@ -166,7 +166,10 @@ class Server:
     def load(cls, *files: str) -> 'Server':
         """Загружает конфигурацию сервера и источники данных."""
         config = configparser.ConfigParser()
-        config.read(files)
+        if files:
+            config.read(files)
+        else:
+            config = _build_sqlite_runtime_config()
         
         metadata = {}
         datasources = {}
